@@ -1,7 +1,12 @@
 const $ = selector => document.querySelector(selector)
 
 // На iPhone звук играет нативный AVPlayer (см. mobile/bridge.js), иначе экран блокировки занимает WebKit.
-const audio = sc.createAudio?.() ?? $('#audio')
+const htmlAudio = sc.createAudio?.() ?? $('#audio')
+// Играет либо аудио-элемент, либо Spotify SDK (sources.js): события слушаем у обоих, но берём только от активного.
+let audio = htmlAudio
+const onAudio = (type, handler) => {
+  for (const backend of [htmlAudio, spotifyAudio]) backend.addEventListener(type, event => event.target === audio && handler(event))
+}
 // На iPhone композитинг дорогой: класс включает облегчённые стили (см. .native в style.css).
 const native = Boolean(window.Capacitor)
 document.documentElement.classList.toggle('native', native)
@@ -168,7 +173,7 @@ function trackRows(tracks, listId, offset = 0) {
         ${artBox(cover(t, 'large'), 'row-art')}
         <span class="row-main">
           <span class="row-line"><span class="row-title" title="${esc(t.title)}">${esc(t.title)}</span>${drmOnly(t) ? '<span class="tag" title="SoundCloud отдаёт этот трек только с DRM — сторонние плееры его не сыграют">DRM</span>' : previewOnly(t) ? '<span class="tag">превью</span>' : ''}</span>
-          <button class="link row-artist" data-user="${t.user.id}">${esc(t.user.username)}</button>
+          ${t.source ? `<span class="row-artist">${esc(t.user.username)}</span>` : `<button class="link row-artist" data-user="${t.user.id}">${esc(t.user.username)}</button>`}
         </span>
         <span class="row-plays">${fmtCount(t.playback_count)}</span>
         <span class="row-dur">${fmtTime(t.full_duration / 1000)}</span>
@@ -403,6 +408,23 @@ const listenedToday = () => daySeconds(today())
 
 let history = JSON.parse(localStorage.getItem('history') ?? '[]')
 
+// Прослушивания по дням — для недели и месяца: история хранит только последние 500 треков, и «прослушиваний»
+// за месяц упиралось в 500. Первый раз заполняем из того, что уже лежит в истории.
+let playedDays = JSON.parse(localStorage.getItem('playedDays') ?? 'null') ?? history.reduce((days, { at }) => {
+  const day = new Date(at).toLocaleDateString('sv')
+  days[day] = (days[day] ?? 0) + 1
+  return days
+}, {})
+let peerPlayed = JSON.parse(localStorage.getItem('peerPlayed') ?? '{}')
+const playsOn = day => (playedDays[day] ?? 0) + Object.values(peerPlayed).reduce((sum, days) => sum + (days[day] ?? 0), 0)
+
+function countPlay() {
+  playedDays[today()] = (playedDays[today()] ?? 0) + 1
+  const oldest = new Date(Date.now() - 60 * 864e5).toLocaleDateString('sv')
+  playedDays = Object.fromEntries(Object.entries(playedDays).filter(([day]) => day >= oldest))
+  localStorage.setItem('playedDays', JSON.stringify(playedDays))
+}
+
 // Счётчики за всё время: история хранит последние 500 треков, минуты по дням — 60 дней,
 // поэтому «всего» считаем отдельно. Первый раз заполняем из того, что уже накопилось.
 let lifetime = JSON.parse(localStorage.getItem('lifetime') ?? 'null') ?? {
@@ -437,8 +459,16 @@ function listeningStreak() {
 }
 
 function addToHistory(track) {
+  // Чужие площадки в историю SoundCloud не попадают: по id их не достать из api-v2. Считаем только прослушивание.
+  if (track.source) {
+    countPlay()
+    lifetime.plays++
+    saveLifetime()
+    return
+  }
   if (history[0]?.id === track.id) return
   history = [{ id: track.id, at: Date.now() }, ...history].slice(0, 500)
+  countPlay()
   localStorage.setItem('history', JSON.stringify(history))
   lifetime.plays++
   if (!lifetime.tracks.includes(track.id)) lifetime.tracks.push(track.id)
@@ -812,13 +842,13 @@ function applyNormalize(on) {
 }
 
 function ensureAudioGraph() {
-  if (audioCtx || ios || !(audio instanceof HTMLMediaElement)) return
+  if (audioCtx || ios || !(htmlAudio instanceof HTMLMediaElement)) return
   try {
     audioCtx = new (window.AudioContext || window.webkitAudioContext)()
     compressor = audioCtx.createDynamicsCompressor()
     analyser = audioCtx.createAnalyser()
     analyser.fftSize = 256
-    audioCtx.createMediaElementSource(audio).connect(compressor).connect(audioCtx.destination)
+    audioCtx.createMediaElementSource(htmlAudio).connect(compressor).connect(audioCtx.destination)
     compressor.connect(analyser)
     applyNormalize(normalizeEnabled())
   } catch {
@@ -1187,6 +1217,8 @@ async function historyStats(days) {
   const plays = history.filter(h => h.at >= since && tracks.has(h.id))
   const allDays = new Set([...Object.keys(listenedDays), ...Object.values(peerListened).flatMap(Object.keys)])
   const seconds = [...allDays].filter(day => day > sinceDay).reduce((sum, day) => sum + daySeconds(day), 0)
+  const playDays = new Set([...Object.keys(playedDays), ...Object.values(peerPlayed).flatMap(Object.keys)])
+  const playCount = [...playDays].filter(day => day > sinceDay).reduce((sum, day) => sum + playsOn(day), 0)
   const trackCounts = new Map()
   const artistCounts = new Map()
   for (const { id } of plays) {
@@ -1198,7 +1230,7 @@ async function historyStats(days) {
   const byArtist = new Map()
   for (const [user, n] of artistCounts) byArtist.set(user.id, [user, (byArtist.get(user.id)?.[1] ?? 0) + n])
   const top = counts => [...counts].sort((a, b) => b[1] - a[1]).slice(0, 5)
-  return { tracks, plays, seconds, trackCounts, topTracks: top(trackCounts), topArtists: top(byArtist.values()) }
+  return { tracks, plays, playCount, seconds, trackCounts, topTracks: top(trackCounts), topArtists: top(byArtist.values()) }
 }
 
 async function renderRecap(_arg, mount) {
@@ -1214,7 +1246,7 @@ async function renderRecap(_arg, mount) {
       <section class="recap-slide recap-minutes">
         <p class="eyebrow">Итоги недели · ${esc(recapRange())}</p>
         <p class="recap-huge">${fmtCount(Math.round(stats.seconds / 60))}</p>
-        <p class="recap-caption">${plural(Math.round(stats.seconds / 60), ['минута', 'минуты', 'минут'])} музыки, ${countOf(stats.plays.length, ['прослушивание', 'прослушивания', 'прослушиваний'])}</p>
+        <p class="recap-caption">${plural(Math.round(stats.seconds / 60), ['минута', 'минуты', 'минут'])} музыки, ${countOf(stats.playCount, ['прослушивание', 'прослушивания', 'прослушиваний'])}</p>
       </section>
       <section class="recap-slide recap-artist">
         <p class="eyebrow">Автор недели</p>
@@ -1398,7 +1430,7 @@ async function renderHistory(period = '7', mount) {
     mount(`<h1 class="page-title">История</h1>${stateBlock('Пока пусто', 'Здесь будет всё, что играло в Cloudwave.', '', 'i-history')}`)
     return
   }
-  const { tracks, plays, seconds, trackCounts, topTracks, topArtists } = await historyStats(Number(period))
+  const { tracks, playCount, seconds, trackCounts, topTracks, topArtists } = await historyStats(Number(period))
   const topListId = registerList(topTracks.map(([t]) => t), { label: 'Чаще всего' })
 
   const days = new Map()
@@ -1414,7 +1446,7 @@ async function renderHistory(period = '7', mount) {
       ${[['7', 'Неделя'], ['30', 'Месяц']].map(([value, label]) => `<button class="chip" data-history-period="${value}" aria-pressed="${value === period}">${label}</button>`).join('')}
     </div>
     <dl class="stats">
-      <div><dt>Прослушиваний</dt><dd>${fmtCount(plays.length)}</dd></div>
+      <div><dt>Прослушиваний</dt><dd>${fmtCount(playCount)}</dd></div>
       <div><dt>Разных треков</dt><dd>${fmtCount(trackCounts.size)}</dd></div>
       <div><dt>Время</dt><dd>${fmtLong(seconds * 1000)}</dd></div>
     </dl>
@@ -1432,13 +1464,27 @@ async function renderHistory(period = '7', mount) {
     ${[...days].map(([label, dayTracks]) => section(label, trackTable(dayTracks, registerList(dayTracks, { label: 'История' })))).join('')}`)
 }
 
+const sourceChips = () => sources.available().length < 2 ? '' : `<div class="chips search-sources" role="group" aria-label="Источник">${sources.available().map(({ id, label }) => `<button class="chip" data-search-source="${id}" aria-pressed="${id === sources.current()}">${label}</button>`).join('')}</div>`
+
+async function renderExternalSearch(q, source, mount) {
+  const { tracks, total } = await sources.search(source, q)
+  const id = registerList(tracks, { label: `Поиск «${q}» · ${EXTERNAL_TITLES[source]}` })
+  mount(`
+    <h1 class="page-title">«${esc(q)}»</h1>
+    ${sourceChips()}
+    <p class="page-sub">${countOf(total, TRACK_FORMS)} на ${EXTERNAL_TITLES[source]}</p>
+    ${tracks.length ? section('Треки', trackTable(tracks, id)) : stateBlock('Ничего не нашлось', 'Попробуй написать иначе.')}`)
+}
+
 async function renderSearch(query, mount) {
   const q = query?.trim()
+  const source = sources.current()
   if (!q) {
-    mount(`<h1 class="page-title">Поиск</h1>${genreSection()}`)
+    mount(`<h1 class="page-title">Поиск</h1>${sourceChips()}${source === 'soundcloud' ? genreSection() : `<p class="page-sub">Ищу на ${EXTERNAL_TITLES[source]}: начни вводить запрос.</p>`}`)
     searchInput.focus()
     return
   }
+  if (source !== 'soundcloud') return renderExternalSearch(q, source, mount)
 
   const params = `q=${encodeURIComponent(q)}`
   // Авторы и плейлисты второстепенны: если упал только их запрос, треки всё равно показываем.
@@ -1452,12 +1498,13 @@ async function renderSearch(query, mount) {
   const id = registerList(found, { label: `Поиск «${q}»` }, tracks.next_href && { href: tracks.next_href, pick: page => page.collection })
 
   if (!found.length && !playlists.collection.length && !users.collection.length) {
-    mount(`<h1 class="page-title">«${esc(q)}»</h1>${stateBlock('Ничего не нашлось', 'Попробуй написать иначе или латиницей — SoundCloud ищет по оригинальным названиям.')}`)
+    mount(`<h1 class="page-title">«${esc(q)}»</h1>${sourceChips()}${stateBlock('Ничего не нашлось', 'Попробуй написать иначе или латиницей — SoundCloud ищет по оригинальным названиям.')}`)
     return
   }
 
   const ok = mount(`
     <h1 class="page-title">«${esc(q)}»</h1>
+    ${sourceChips()}
     <p class="page-sub">${countOf(tracks.total_results ?? found.length, TRACK_FORMS)} на SoundCloud</p>
     ${users.collection.length ? section('Авторы', `<div class="strip">${users.collection.map(userCard).join('')}</div>`) : ''}
     ${playlists.collection.length ? section('Плейлисты', `<div class="strip">${playlists.collection.map(playlistCard).join('')}</div>`) : ''}
@@ -1628,6 +1675,15 @@ function renderSettings(_arg, mount) {
     const slot = view.querySelector('#sync-info')
     if (slot) slot.innerHTML = `Адрес: <b>${esc(info.address)}</b><br>Ключ: <b>${esc(info.key)}</b>`
   })
+  sc.spotify?.status().then(info => {
+    const id = view.querySelector('#spotify-id')
+    if (!id) return
+    id.value = info.clientId
+    view.querySelector('#spotify-status').textContent = info.loggedIn ? `Вошёл как ${info.name}${info.premium ? '' : ' — но это не Premium, играть не получится'}` : info.error ? `Не вошёл: ${info.error}` : 'Не вошёл'
+    view.querySelector('#spotify-login').textContent = info.loggedIn ? 'Выйти' : 'Войти'
+    spotifyLoggedIn = info.loggedIn
+    sources.spotify.ready = info.loggedIn
+  }, () => {})
   sc.discord?.get().then(id => {
     const input = view.querySelector('#discord-id')
     if (input) input.value = id
@@ -1685,7 +1741,7 @@ function renderSettings(_arg, mount) {
       </div>`) : ''}
 
     ${section('Аудио', `
-      <div class="setting-row"${audio instanceof HTMLMediaElement && !ios ? '' : ' hidden'}>
+      <div class="setting-row"${htmlAudio instanceof HTMLMediaElement && !ios ? '' : ' hidden'}>
         <span class="setting-label"><b>Выравнивать громкость</b><br>Компрессор сглаживает пики между тихими и громкими треками. Экспериментально.</span>
         <button class="btn" data-action="toggleNormalize" aria-pressed="${on}">${on ? 'Включено' : 'Выключено'}</button>
       </div>
@@ -1723,6 +1779,26 @@ function renderSettings(_arg, mount) {
       </div>` : '<p class="sidebar-empty">Пока нет ни одного</p>'}
       <button class="btn" data-action="createPlaylist" style="margin-top: 12px">Создать плейлист</button>
       <button class="btn" data-action="importPlaylist" style="margin-top: 12px">Импорт JSON</button>`)}
+
+    ${sources.supported ? section('Источники музыки', `
+      <div class="setting-row">
+        <span class="setting-label"><b>Audius и Internet Archive</b><br>Работают без входа: в Поиске переключи источник под строкой запроса. У таких треков нет лайков, плейлистов и офлайна, а Archive отдаёт записи целиком (играет первый MP3).</span>
+      </div>
+      <form class="setting-row" id="jamendo-form">
+        <span class="setting-label"><b>Jamendo</b><br>Нужен свой Client ID с devportal.jamendo.com (бесплатно). С ним Jamendo появится в Поиске.</span>
+        <span class="field-row">
+          <input class="field" name="jamendoKey" value="${esc(sources.jamendoKey())}" placeholder="Client ID" autocomplete="off" spellcheck="false">
+          <button class="btn">Сохранить</button>
+        </span>
+      </form>
+      ${sc.spotify ? `<form class="setting-row" id="spotify-form">
+        <span class="setting-label"><b>Spotify</b> (нужен Premium)<br>Создай приложение на developer.spotify.com/dashboard, добавь Redirect URI <b id="spotify-redirect">http://127.0.0.1:47823/callback</b>, отметь Web Playback SDK и вставь Client ID.<br><span id="spotify-status">…</span></span>
+        <span class="field-row">
+          <input class="field" name="spotifyId" id="spotify-id" placeholder="Client ID" autocomplete="off" spellcheck="false">
+          <button class="btn" name="spotifyAct" value="save">Сохранить</button>
+          <button class="btn btn-accent" name="spotifyAct" value="login" id="spotify-login">Войти</button>
+        </span>
+      </form>` : ''}`) : ''}
 
     ${sc.discord ? section('Discord', `
       <form class="setting-row" id="discord-form">
@@ -1830,6 +1906,7 @@ async function boot() {
     toast(`Загрузки недоступны: ${errorText(err)}`)
   }
 
+  sources.spotify.refresh()
   renderAccount()
   renderSidebarPlaylists()
   syncLikeButtons()
@@ -1851,6 +1928,8 @@ function localSnapshot() {
     history,
     listenedDays,
     peerListened,
+    playedDays,
+    peerPlayed,
     lifetime,
     peerLifetime,
     localPlaylists: loadLocalPlaylists(),
@@ -1883,6 +1962,16 @@ function mergeSnapshots(mine, theirs) {
   for (const [device, days] of Object.entries(mine.peerListened ?? {})) addPeer(device, days)
   for (const [device, days] of Object.entries(theirs.peerListened ?? {})) addPeer(device, days)
   addPeer(theirs.device, theirs.listenedDays)
+
+  const peersPlayed = {}
+  const addPlayed = (device, days) => {
+    if (!device || device === mine.device) return
+    const into = (peersPlayed[device] ??= {})
+    for (const [day, count] of Object.entries(days ?? {})) into[day] = Math.max(into[day] ?? 0, count)
+  }
+  for (const [device, days] of Object.entries(mine.peerPlayed ?? {})) addPlayed(device, days)
+  for (const [device, days] of Object.entries(theirs.peerPlayed ?? {})) addPlayed(device, days)
+  addPlayed(theirs.device, theirs.playedDays)
 
   const peerLife = {}
   const addLife = (device, life) => {
@@ -1918,6 +2007,8 @@ function mergeSnapshots(mine, theirs) {
     history,
     listenedDays: mine.listenedDays,
     peerListened: peers,
+    playedDays: mine.playedDays,
+    peerPlayed: peersPlayed,
     lifetime: mine.lifetime,
     peerLifetime: peerLife,
     localPlaylists,
@@ -1930,9 +2021,11 @@ function applySnapshot(snapshot) {
   const sessionChanged = (snapshot.session?.at ?? 0) > (JSON.parse(localStorage.getItem('session') ?? 'null')?.at ?? 0)
   history = snapshot.history
   peerListened = snapshot.peerListened
+  peerPlayed = snapshot.peerPlayed ?? peerPlayed
   peerLifetime = snapshot.peerLifetime ?? peerLifetime
   localStorage.setItem('history', JSON.stringify(history))
   localStorage.setItem('peerListened', JSON.stringify(peerListened))
+  localStorage.setItem('peerPlayed', JSON.stringify(peerPlayed))
   localStorage.setItem('peerLifetime', JSON.stringify(peerLifetime))
   localStorage.setItem('deletedPlaylists', JSON.stringify(snapshot.deletedPlaylists))
   localStorage.setItem('localPlaylists', JSON.stringify(snapshot.localPlaylists))
@@ -2002,9 +2095,10 @@ let restoreToken = 0
 function sessionState(position) {
   // Радио растит очередь бесконечно — храним окно вокруг текущего трека.
   const start = Math.max(0, state.index - 100)
+  const kept = state.queue.slice(start, start + 400).filter(t => !t.source)
   return {
-    ids: state.queue.slice(start, start + 400).map(t => t.id),
-    index: state.index - start,
+    ids: kept.map(t => t.id),
+    index: kept.indexOf(state.queue[state.index]),
     position: Math.floor(position),
     context: state.context?.label ? { label: state.context.label } : null,
     shuffle: state.shuffle,
@@ -2013,7 +2107,8 @@ function sessionState(position) {
 }
 
 function saveSession(position = audio.getAttribute('src') ? audio.currentTime : resumeAt) {
-  if (!state.queue[state.index]) return
+  // Трек другой площадки после перезапуска не восстановить (его нет в api-v2): прежняя сохранёнка остаётся.
+  if (!state.queue[state.index] || state.queue[state.index].source) return
   sessionSavedAt = performance.now()
   const session = sessionState(position)
   const body = JSON.stringify(session)
@@ -2214,12 +2309,13 @@ async function resolveSource(track) {
     prefetched.delete(track.id)
     return cached
   }
-  const offlineSrc = await sc.downloads.get(track.id)
+  const offlineSrc = !track.source && await sc.downloads.get(track.id)
   if (offlineSrc) return { track, source: { url: offlineSrc, hls: false, preview: false } }
   return freshStream(track)
 }
 
 async function freshStream(track) {
+  if (track.source) return { track, source: await sources.stream(track) }
   try {
     return { track, source: await sc.stream(track) }
   } catch {
@@ -2308,9 +2404,26 @@ const drmConfig = token => ({
   },
 })
 
+// Забирает плеер у прежнего источника: звук, громкость и «без звука» переходят к новому.
+function useAudio(backend) {
+  if (audio === backend) return
+  if (audio === spotifyAudio) spotifyAudio.release()
+  else audio.pause()
+  backend.volume = audio.volume
+  backend.muted = audio.muted
+  audio = backend
+}
+
 function load(source, startAt) {
   hls?.destroy()
   hls = null
+  if (source.spotifyUri) {
+    useAudio(spotifyAudio)
+    $('#preview-badge').hidden = true
+    spotifyAudio.start(source.spotifyUri, startAt)
+    return
+  }
+  useAudio(htmlAudio)
   // Safari на iOS играет HLS сам, а MediaSource для hls.js там есть не везде. Chromium в Electron тоже
   // говорит, что умеет HLS, но его встроенный плеер не знает EME — зашифрованный поток ведёт только hls.js.
   if (source.hls && (source.licenseToken || !audio.canPlayType('application/vnd.apple.mpegurl'))) {
@@ -2319,7 +2432,7 @@ function load(source, startAt) {
       if (data.fatal) recover()
     })
     hls.loadSource(source.url)
-    hls.attachMedia(audio)
+    hls.attachMedia(htmlAudio)
   } else {
     // Без CORS-режима Web Audio получил бы от чужого CDN тишину; у файлов и capacitor:// его нет.
     audio.crossOrigin = /^https?:/.test(source.url) ? 'anonymous' : null
@@ -2388,7 +2501,7 @@ function extendQueue() {
 async function growFromRelated() {
   const queue = state.queue
   const seed = queue[queue.length - 1]
-  if (!seed) return false
+  if (!seed || seed.source) return false
   try {
     const seen = new Set(queue.map(t => t.id))
     let fresh = []
@@ -2510,8 +2623,11 @@ function showTrack(track, restoring = false) {
   $('#now-context').textContent = state.context ? `Сейчас играет · ${state.context.label}` : 'Сейчас играет'
   $('#now-title').textContent = track.title
   $('#now-artist').textContent = track.user.username
-  $('#now-artist').dataset.user = track.user.id
+  $('#now-add').hidden = Boolean(track.source)
+  if (track.source) delete $('#now-artist').dataset.user
+  else $('#now-artist').dataset.user = track.user.id
   $('#now-source').href = track.permalink_url
+  $('#now-source').lastChild.textContent = `Открыть в ${track.source ? EXTERNAL_TITLES[track.source] : 'SoundCloud'}`
   $('#now-stats').innerHTML = [
     ['Прослушивания', fmtCount(track.playback_count)],
     ['Лайки', fmtCount(track.likes_count)],
@@ -2537,11 +2653,12 @@ function showTrack(track, restoring = false) {
 }
 
 let likeBusy = false
+let spotifyLoggedIn = false
 
 async function toggleLike() {
   const track = state.queue[state.index]
   // canLike — кнопки скрыты (PWA), но клавиша L и экран блокировки всё равно сюда попадают.
-  if (!track || !state.loggedIn || likeBusy || sc.canLike === false) return
+  if (!track || track.source || !state.loggedIn || likeBusy || sc.canLike === false) return
   const liked = state.likedIds.has(track.id)
   likeBusy = true
   sc.haptic?.()
@@ -2568,7 +2685,7 @@ function syncLikeButtons(animate = false) {
   const track = state.queue[state.index]
   const liked = Boolean(track) && state.likedIds.has(track.id)
   for (const button of [$('#like'), $('#now-like')]) {
-    button.hidden = !state.loggedIn || !track || sc.canLike === false
+    button.hidden = !state.loggedIn || !track || track.source || sc.canLike === false
     button.setAttribute('aria-pressed', liked)
     button.setAttribute('aria-label', liked ? 'Убрать лайк' : 'Лайкнуть')
     button.querySelector('use').setAttribute('href', liked ? '#i-heart-filled' : '#i-heart')
@@ -2591,6 +2708,7 @@ function syncMpris(seeked = false) {
     album: state.context?.label ?? '',
     artUrl: cover(track, 't500x500'),
     url: track.permalink_url,
+    service: track.source ? EXTERNAL_TITLES[track.source] : 'SoundCloud',
     length: Number.isFinite(audio.duration) && audio.duration ? audio.duration : track.full_duration / 1000,
     position: audio.currentTime,
     playing: !audio.paused,
@@ -2612,7 +2730,7 @@ function syncMpris(seeked = false) {
 function markCurrent() {
   const id = state.queue[state.index]?.id
   for (const el of document.querySelectorAll('.row[data-track], .card[data-track], .mini-row[data-track]')) {
-    el.classList.toggle('is-current', Number(el.dataset.track) === id)
+    el.classList.toggle('is-current', el.dataset.track === String(id))
   }
   renderQueue()
 }
@@ -3122,6 +3240,8 @@ function openMenu(el) {
   if (!menuTrack) return
   document.querySelector('.row-more.open, .mini-more.open')?.classList.remove('open')
   const menu = $('#track-menu')
+  // У треков других площадок нет автора, станции, плейлистов и офлайна SoundCloud.
+  for (const item of ['station', 'artist', 'playlist', 'download']) menu.querySelector(`[data-menu="${item}"]`).hidden = Boolean(menuTrack.source)
   menu.querySelector('[data-menu="removeFromPlaylist"]').hidden = !(current.name === 'localPlaylist' || (current.name === 'playlist' && isOwnPlaylist(current.arg)))
   menu.hidden = false
   const box = el.getBoundingClientRect()
@@ -3188,6 +3308,9 @@ document.addEventListener('click', event => {
     go('mix', dataset.mix)
   } else if (dataset.view) {
     go(dataset.view)
+  } else if (dataset.searchSource) {
+    sources.set(dataset.searchSource)
+    go('search', searchInput.value, false)
   } else if (dataset.search) {
     go('search', dataset.search)
   } else if (dataset.playList) {
@@ -3195,7 +3318,7 @@ document.addEventListener('click', event => {
   } else if (dataset.shuffleList) {
     playList(dataset.shuffleList, Math.floor(Math.random() * (lists.get(dataset.shuffleList)?.tracks.length ?? 0)), true)
   } else if (dataset.list) {
-    if (Number(dataset.track) === state.queue[state.index]?.id) togglePlay()
+    if (dataset.track === String(state.queue[state.index]?.id)) togglePlay()
     else playList(dataset.list, Number(dataset.index))
   } else if (dataset.localPlaylist) {
     go('localPlaylist', dataset.localPlaylist)
@@ -3266,6 +3389,36 @@ view.addEventListener('submit', async event => {
     const withPort = !address || /:\d+$/.test(address) ? address : `${address}:47821`
     localStorage.setItem('syncPeer', JSON.stringify({ address: withPort, key: form.key.value.trim() }))
     await syncNow(true)
+    refreshSettings()
+    return
+  }
+  if (form.id === 'jamendo-form') {
+    localStorage.setItem('jamendoKey', form.jamendoKey.value.trim())
+    if (!form.jamendoKey.value.trim() && sources.current() === 'jamendo') sources.set('soundcloud')
+    toast(form.jamendoKey.value.trim() ? 'Jamendo добавлен в поиск' : 'Jamendo убран из поиска')
+    return
+  }
+  if (form.id === 'spotify-form') {
+    const act = event.submitter?.value
+    try {
+      if (act === 'login' && spotifyLoggedIn) {
+        await sc.spotify.logout()
+        sources.spotify.ready = false
+        if (sources.current() === 'spotify') sources.set('soundcloud')
+        toast('Вышел из Spotify')
+      } else {
+        await sc.spotify.setClientId(form.spotifyId.value)
+        if (act === 'login') {
+          toast('Подтверди вход в Spotify в браузере')
+          await sc.spotify.login()
+          toast('Spotify подключён')
+        } else {
+          toast('Client ID сохранён')
+        }
+      }
+    } catch (err) {
+      toast(errorText(err))
+    }
     refreshSettings()
     return
   }
@@ -3441,7 +3594,7 @@ $('#now-queue').addEventListener('click', () => {
 })
 $('#now-lyrics-toggle').addEventListener('click', () => toggleLyrics())
 $('#now-karaoke').addEventListener('click', () => toggleKaraoke())
-audio.addEventListener('play', startKaraoke)
+onAudio('play', startKaraoke)
 
 lyricsEl.addEventListener('click', event => {
   const line = event.target.closest('[data-line]')
@@ -3494,30 +3647,30 @@ waveEl.addEventListener('click', event => {
 })
 new ResizeObserver(requestDraw).observe(waveEl)
 
-audio.addEventListener('play', () => {
+onAudio('play', () => {
   syncPlayButton()
   startBeat()
 })
-audio.addEventListener('pause', () => {
+onAudio('pause', () => {
   syncPlayButton()
   saveListened()
   saveSession()
 })
-audio.addEventListener('playing', () => {
+onAudio('playing', () => {
   reloadedFor = null
 })
-audio.addEventListener('ended', next)
-audio.addEventListener('volumechange', syncVolume)
-audio.addEventListener('error', () => {
+onAudio('ended', next)
+onAudio('volumechange', syncVolume)
+onAudio('error', () => {
   if (!hls && audio.getAttribute('src')) recover()
 })
-audio.addEventListener('durationchange', () => {
+onAudio('durationchange', () => {
   if (!Number.isFinite(audio.duration)) return
   $('#time-dur').textContent = fmtTime(audio.duration)
   $('#now-dur').textContent = fmtTime(audio.duration)
   syncMpris()
 })
-audio.addEventListener('timeupdate', () => {
+onAudio('timeupdate', () => {
   const { currentTime, duration } = audio
   const known = Number.isFinite(duration) && duration > 0
   if (!state.seeking) {
@@ -3593,7 +3746,7 @@ document.addEventListener('touchend', event => {
   pressFired = false
 })
 
-audio.addEventListener('seeked', () => syncMpris(true))
+onAudio('seeked', () => syncMpris(true))
 
 const mediaActions = {
   play: () => audio.paused && togglePlay(),
@@ -3620,7 +3773,7 @@ if (windows) {
 
 const savedVolume = Number(localStorage.getItem('volume') ?? 80)
 setRange($('#volume'), savedVolume)
-audio.volume = (savedVolume / 100) ** 2
+htmlAudio.volume = spotifyAudio.volume = (savedVolume / 100) ** 2
 syncVolume()
 syncPlayButton()
 if (localStorage.getItem('lyrics') === 'true') toggleLyrics(true)

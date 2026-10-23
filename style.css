@@ -1604,3 +1604,5 @@ body.is-paused .now-backdrop img { animation-play-state: paused; }
   .library-stats dd { font-size: var(--text-lg); }
   .hero-manage { flex-wrap: wrap; margin-bottom: 10px; }
 }
+
+.search-sources { margin: 0 0 16px; }

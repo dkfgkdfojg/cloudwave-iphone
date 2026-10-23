@@ -12,6 +12,7 @@ fs.mkdirSync(www)
 
 fs.copyFileSync(path.join(root, 'style.css'), path.join(www, 'style.css'))
 fs.copyFileSync(path.join(root, 'renderer.js'), path.join(www, 'renderer.js'))
+fs.copyFileSync(path.join(root, 'sources.js'), path.join(www, 'sources.js'))
 fs.copyFileSync(path.join(here, 'bridge.js'), path.join(www, 'bridge.js'))
 // Без бандлера Capacitor.registerPlugin и Capacitor.Plugins.CapacitorHttp берутся не из
 // нативного моста (тот добавляет только сообщения), а из этого браузерного билда ядра.
