@@ -2149,7 +2149,8 @@ const actions = {
       }
       const playlists = loadLocalPlaylists()
       const id = `p${Date.now()}`
-      const name = items.name ?? file.name.replace(/\.json$/i, '')
+      const named = typeof items?.name === 'string' ? items.name.trim() : ''
+      const name = named || file.name.replace(/\.json$/i, '') || 'Импорт'
       playlists[id] = { id, name, trackIds, updatedAt: Date.now() }
       saveLocalPlaylists(playlists)
       toast(`Плейлист «${name}»: ${countOf(trackIds.length, TRACK_FORMS)}`)
@@ -2327,8 +2328,9 @@ function load(source, startAt) {
   }
   if (normalizeEnabled()) ensureAudioGraph()
   audioCtx?.resume().catch(() => {})
+  // NotSupportedError — битый или недоступный поток: о нём уже сообщает событие 'error' у audio.
   audio.play().catch(err => {
-    if (err.name !== 'AbortError') throw err
+    if (!['AbortError', 'NotSupportedError'].includes(err.name)) throw err
   })
   $('#preview-badge').hidden = !source.preview
 }
