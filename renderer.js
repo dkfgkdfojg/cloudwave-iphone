@@ -695,6 +695,7 @@ function removeFromLocalPlaylist(id, trackId) {
   const playlists = loadLocalPlaylists()
   if (!playlists[id]) return
   playlists[id].trackIds = playlists[id].trackIds.filter(t => t !== trackId)
+  delete playlists[id].external?.[trackId]
   playlists[id].updatedAt = Date.now()
   saveLocalPlaylists(playlists)
 }
@@ -706,6 +707,50 @@ function deleteLocalPlaylist(id) {
   const deleted = JSON.parse(localStorage.getItem('deletedPlaylists') ?? '{}')
   deleted[id] = Date.now()
   localStorage.setItem('deletedPlaylists', JSON.stringify(deleted))
+}
+
+// Импорт по ссылке: список «исполнитель — название» с Spotify или Яндекс Музыки, звук ищется на SoundCloud
+// (запасной путь на ПК — Audius). Проверяем по 4 трека одновременно, чтобы не устроить шторм запросов.
+async function matchEntry(entry) {
+  const q = importers.queryFor(entry)
+  const page = await sc.api(`/search/tracks?q=${encodeURIComponent(q)}&limit=10`)
+  const usable = page.collection.filter(t => listable(t) && !drmOnly(t) && !previewOnly(t))
+  const hit = importers.bestMatch(entry, usable)
+  if (hit || !sources.supported) return hit
+  return importers.bestMatch(entry, (await sources.audius.search(q).catch(() => ({ tracks: [] }))).tracks)
+}
+
+async function importFromLink(link, onProgress) {
+  const list = await importers.load(link, {
+    fetchText: sc.fetchPage,
+    spotifyCall: sc.spotify && spotifyLoggedIn ? path => sc.spotify.call(path) : null,
+  })
+  const found = new Array(list.tracks.length).fill(null)
+  const failed = []
+  let next = 0
+  let done = 0
+  await Promise.all(Array.from({ length: 4 }, async () => {
+    while (next < list.tracks.length) {
+      const index = next++
+      try {
+        found[index] = await matchEntry(list.tracks[index])
+      } catch {
+        failed.push(list.tracks[index])
+      }
+      onProgress(++done, list.tracks.length, found.filter(Boolean).length)
+    }
+  }))
+  return { ...list, found, failed }
+}
+
+function saveImported(result) {
+  const matched = result.found.filter(Boolean)
+  const playlists = loadLocalPlaylists()
+  const id = `p${Date.now()}`
+  const external = Object.fromEntries(matched.filter(t => t.source).map(t => [t.id, t]))
+  playlists[id] = { id, name: result.title, trackIds: [...new Set(matched.map(t => t.id))], updatedAt: Date.now(), ...(Object.keys(external).length && { external }) }
+  saveLocalPlaylists(playlists)
+  return id
 }
 
 // Миксы пересобираются каждый день, поэтому понравившийся сохраняем копией в плейлист SoundCloud.
@@ -1654,7 +1699,9 @@ async function renderLocalPlaylist(id, mount) {
     mount(stateBlock('Плейлист не найден', 'Возможно, его удалили в настройках.', '<button class="btn" data-view="settings">К настройкам</button>', 'i-playlist'))
     return
   }
-  const tracks = await hydrate(playlist.trackIds.map(trackId => ({ id: trackId })))
+  const hydrated = new Map((await hydrate(playlist.trackIds.filter(trackId => typeof trackId === 'number').map(trackId => ({ id: trackId })))).map(t => [t.id, t]))
+  // Треки Audius из импорта лежат в самом плейлисте: у них нет id для запроса к SoundCloud, а на iPhone они не играют.
+  const tracks = playlist.trackIds.map(trackId => hydrated.get(trackId) ?? (sources.supported ? playlist.external?.[trackId] : undefined)).filter(Boolean)
   const listId = registerList(tracks, { label: playlist.name })
 
   mount(`
@@ -1778,7 +1825,8 @@ function renderSettings(_arg, mount) {
           </div>`).join('')}
       </div>` : '<p class="sidebar-empty">Пока нет ни одного</p>'}
       <button class="btn" data-action="createPlaylist" style="margin-top: 12px">Создать плейлист</button>
-      <button class="btn" data-action="importPlaylist" style="margin-top: 12px">Импорт JSON</button>`)}
+      <button class="btn" data-action="importPlaylist" style="margin-top: 12px">Импорт JSON</button>
+      ${sc.fetchPage ? '<button class="btn" data-action="importLink" style="margin-top: 12px">Импорт по ссылке</button>' : ''}`)}
 
     ${sources.supported ? section('Источники музыки', `
       <div class="setting-row">
@@ -2252,6 +2300,12 @@ const actions = {
       go('localPlaylist', id)
     }
     input.click()
+  },
+  importLink() {
+    $('#import-status').textContent = ''
+    $('#import-missing').hidden = true
+    $('#import-open').hidden = true
+    $('#import-dialog').showModal()
   },
   async backupLikes() {
     try {
@@ -3447,6 +3501,51 @@ view.addEventListener('submit', async event => {
     button.disabled = false
     button.removeAttribute('aria-busy')
   }
+})
+
+let importing = false
+$('#import-form').addEventListener('submit', async event => {
+  event.preventDefault()
+  if (importing) return
+  importing = true
+  const form = event.target
+  const status = $('#import-status')
+  const missing = $('#import-missing')
+  const button = form.querySelector('button')
+  missing.hidden = true
+  $('#import-open').hidden = true
+  button.disabled = true
+  status.textContent = 'Читаю список…'
+  try {
+    const result = await importFromLink(form.link.value, (done, total, matched) => {
+      status.textContent = `Проверено ${done} из ${total}, найдено ${matched}`
+    })
+    const matched = result.found.filter(Boolean).length
+    if (!matched) {
+      status.textContent = `Ничего не нашлось на SoundCloud (${result.tracks.length} треков в списке)${result.failed.length ? '. Поиск отвечал с ошибками — попробуй позже' : ''}`
+    } else {
+      const id = saveImported(result)
+      status.textContent = `Плейлист «${result.title}»: найдено ${matched} из ${result.tracks.length}${result.failed.length ? `, ${result.failed.length} не проверены из-за ошибок сети` : ''}${result.note ? `. ${result.note}` : ''}`
+      const lost = result.tracks.filter((_, i) => !result.found[i])
+      $('#import-missing-list').innerHTML = lost.map(t => `<li>${esc(t.artist ? `${t.artist} — ${t.title}` : t.title)}</li>`).join('')
+      missing.hidden = !lost.length
+      form.reset()
+      refreshSettings()
+      toast(`Импортирован «${result.title}»`)
+      $('#import-open').dataset.id = id
+      $('#import-open').hidden = false
+    }
+  } catch (err) {
+    status.textContent = errorText(err)
+  } finally {
+    importing = false
+    button.disabled = false
+  }
+})
+
+$('#import-open').addEventListener('click', event => {
+  $('#import-dialog').close()
+  go('localPlaylist', event.currentTarget.dataset.id)
 })
 
 $('#new-playlist-form').addEventListener('submit', event => {

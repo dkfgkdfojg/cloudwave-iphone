@@ -28,6 +28,16 @@ async function fetchText(url, userAgent = DESKTOP_UA) {
   return res.data
 }
 
+// Импорт плейлистов читает публичные страницы только этих площадок (как fetchPage в main.js на ПК).
+const IMPORT_HOSTS = new Set(['open.spotify.com', 'music.yandex.ru'])
+async function fetchPage(target) {
+  const url = new URL(target)
+  if (url.protocol !== 'https:' || !IMPORT_HOSTS.has(url.hostname)) throw new Error(`Адрес не из списка площадок: ${url.hostname}`)
+  const res = await CapacitorHttp.get({ url: url.href, headers: { 'User-Agent': DESKTOP_UA }, responseType: 'text', readTimeout: 20000, connectTimeout: 20000 })
+  if (res.status !== 200) throw new Error(`${url.hostname} ответил ${res.status}`)
+  return res.data
+}
+
 // Главная soundcloud.com из РФ без VPN не открывается, а m.soundcloud.com отдаёт clientId прямо в HTML
 // (так же берёт ключ pwa/server.mjs). Десктопный бандл остаётся запасным путём.
 async function scrapeClientId() {
@@ -328,6 +338,7 @@ window.sc = bridgeError ? {
   onMedia() {},
 } : {
   api: (target, method, body) => scApi(target, method, body),
+  fetchPage,
   stream: scStream,
   drm: true,
   session: async () => ({ loggedIn: Boolean(localStorage.getItem('token')) }),

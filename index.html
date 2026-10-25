@@ -172,6 +172,19 @@
     <form method="dialog"><button class="btn btn-block">Готово</button></form>
   </dialog>
 
+  <dialog class="dialog" id="import-dialog">
+    <p class="eyebrow">Импорт по ссылке</p>
+    <p>Плейлист или альбом Spotify, альбом Яндекс Музыки. Берём только названия, звук подбирается на SoundCloud.</p>
+    <form id="import-form" class="field-row">
+      <input class="field" name="link" placeholder="https://open.spotify.com/playlist/…" required autocomplete="off">
+      <button class="btn">Импорт</button>
+    </form>
+    <p id="import-status" aria-live="polite"></p>
+    <details id="import-missing" hidden><summary>Не нашлось</summary><ul id="import-missing-list"></ul></details>
+    <button class="btn btn-block" id="import-open" hidden>Открыть плейлист</button>
+    <form method="dialog"><button class="btn btn-block">Закрыть</button></form>
+  </dialog>
+
   <dialog class="dialog" id="rename-dialog">
     <p class="eyebrow">Название плейлиста</p>
     <form id="rename-form" class="field-row">
@@ -192,6 +205,7 @@
 
   <script src="node_modules/hls.js/dist/hls.min.js"></script>
   <script src="sources.js"></script>
+  <script src="importers.js"></script>
   <script src="renderer.js"></script>
 </body>
 </html>
